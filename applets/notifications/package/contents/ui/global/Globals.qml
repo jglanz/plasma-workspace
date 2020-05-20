@@ -20,6 +20,7 @@
 
 pragma Singleton
 import QtQuick 2.8
+import QtQuick.Window 2.12
 import QtQuick.Layouts 1.1
 
 import org.kde.plasma.plasmoid 2.0
@@ -108,15 +109,15 @@ QtObject {
                 alignment |= Qt.AlignLeft;
             } else if (plasmoid.location === PlasmaCore.Types.RightEdge) {
                 alignment |= Qt.AlignRight;
-            } else {
-                // would be nice to do plasmoid.compactRepresentationItem.mapToItem(null) and then
-                // position the popups depending on the relative position within the panel
-                alignment |= Qt.application.layoutDirection === Qt.RightToLeft ? Qt.AlignLeft : Qt.AlignRight;
+            // No horizontal alignment flag has it place it around the notification plasmoid
             }
+
             if (plasmoid.location === PlasmaCore.Types.TopEdge) {
                 alignment |= Qt.AlignTop;
-            } else {
+            } else if (plasmoid.location === PlasmaCore.Types.BottomEdge) {
                 alignment |= Qt.AlignBottom;
+            // No vertical alignment flag has it place it top or bottom edge depending on
+            // what half of the screen the notification plasmoid is in
             }
             return alignment;
 
@@ -134,6 +135,28 @@ QtObject {
             return Qt.AlignBottom | Qt.AlignRight;
         }
     }
+
+    readonly property rect screenRect: {
+        if (!plasmoid) {
+            return Qt.rect(0, 0, -1, -1);
+        }
+
+        return Qt.rect(plasmoid.screenGeometry.x + plasmoid.availableScreenRect.x,
+                       plasmoid.screenGeometry.y + plasmoid.availableScreenRect.y,
+                       plasmoid.availableScreenRect.width,
+                       plasmoid.availableScreenRect.height);
+    }
+    onScreenRectChanged: repositionTimer.start()
+
+    readonly property Item visualParent: {
+        if (!plasmoid) {
+            return null;
+        }
+        return plasmoid.nativeInterface.systemTrayRepresentation
+            || plasmoid.compactRepresentationItem
+            || plasmoid.fullRepresentationItem;
+    }
+    onVisualParentChanged: positionPopups()
 
     readonly property QtObject focusDialog: plasmoid.nativeInterface.focussedPlasmaDialog
     onFocusDialogChanged: positionPopups()
@@ -253,24 +276,40 @@ QtObject {
             return;
         }
 
-        var screenRect = Qt.rect(plasmoid.screenGeometry.x + plasmoid.availableScreenRect.x,
-                                 plasmoid.screenGeometry.y + plasmoid.availableScreenRect.y,
-                                 plasmoid.availableScreenRect.width,
-                                 plasmoid.availableScreenRect.height);
+        const screenRect = globals.screenRect;
         if (screenRect.width <= 0 || screenRect.height <= 0) {
             return;
         }
 
-        var y = screenRect.y;
-        if (popupLocation & Qt.AlignBottom) {
+        const visualParent = globals.visualParent;
+
+        let globalPos = visualParent.mapToItem(null /*mapToScene*/, 0, 0);
+        globalPos.x += (visualParent.x * 0 + visualParent.parent.x * 0);
+
+        const visualParentWindow = visualParent.Window.window;
+        if (visualParentWindow) {
+            globalPos.x += visualParentWindow.x;
+            globalPos.y += visualParentWindow.y;
+        }
+
+        let effectivePopupLocation = popupLocation;
+        // When no vertical alignment is specified, place it depending on which half of the screen
+        // the notification plasmoid is in
+        if (!(effectivePopupLocation & (Qt.AlignTop | Qt.AlignBottom))) {
+            const screenVerticalCenter = screenRect.y + screenRect.height / 2;
+            const globalVerticalCenter = globalPos.y + visualParent.height / 2;
+            if (globalVerticalCenter < screenVerticalCenter) {
+                effectivePopupLocation |= Qt.AlignTop;
+            } else {
+                effectivePopupLocation |= Qt.AlignBottom;
+            }
+        }
+
+        let y = screenRect.y;
+        if (effectivePopupLocation & Qt.AlignBottom) {
             y += screenRect.height - popupEdgeDistance;
         } else {
             y += popupEdgeDistance;
-        }
-
-        var x = screenRect.x;
-        if (popupLocation & Qt.AlignLeft) {
-            x += popupEdgeDistance;
         }
 
         for (var i = 0; i < popupInstantiator.count; ++i) {
@@ -278,15 +317,20 @@ QtObject {
             // Popup width is fixed, so don't rely on the actual window size
             var popupEffectiveWidth = popupWidth + popup.margins.left + popup.margins.right;
 
-            if (popupLocation & Qt.AlignHCenter) {
-                popup.x = x + (screenRect.width - popupEffectiveWidth) / 2;
-            } else if (popupLocation & Qt.AlignRight) {
-                popup.x = x + screenRect.width - popupEdgeDistance - popupEffectiveWidth;
+            const leftMostX = screenRect.x + popupEdgeDistance;
+            const rightMostX = screenRect.x + screenRect.width - popupEdgeDistance - popupEffectiveWidth;
+
+            if (effectivePopupLocation & Qt.AlignLeft) {
+                popup.x = leftMostX;
+            } else if (effectivePopupLocation & Qt.AlignHCenter) {
+                popup.x = screenRect.x + popupEdgeDistance + (screenRect.width - popupEffectiveWidth) / 2;
+            } else if (effectivePopupLocation & Qt.AlignRight) {
+                popup.x = rightMostX;
             } else {
-                popup.x = x;
+                popup.x = Math.max(leftMostX, Math.min(rightMostX, globalPos.x + (visualParent.width - popupEffectiveWidth) / 2));
             }
 
-            if (popupLocation & Qt.AlignTop) {
+            if (effectivePopupLocation & Qt.AlignTop) {
                 // We want to calculate the new position based on its original target position to avoid positioning it and then
                 // positioning it again, hence the temporary Qt.rect with explicit "y" and not just the popup as a whole
                 if (focusDialog && focusDialog.visible && !(focusDialog instanceof NotificationPopup)
@@ -312,7 +356,7 @@ QtObject {
             // don't let notifications take more than popupMaximumScreenFill of the screen
             var visible = true;
             if (i > 0) { // however always show at least one popup
-                if (popupLocation & Qt.AlignTop) {
+                if (effectivePopupLocation & Qt.AlignTop) {
                     visible = (popup.y + popup.height < screenRect.y + (screenRect.height * popupMaximumScreenFill));
                 } else {
                     visible = (popup.y > screenRect.y + (screenRect.height * (1 - popupMaximumScreenFill)));
@@ -324,7 +368,7 @@ QtObject {
     }
 
     property QtObject popupNotificationsModel: NotificationManager.Notifications {
-        limit: plasmoid ? (Math.ceil(plasmoid.availableScreenRect.height / (theme.mSize(theme.defaultFont).height * 4))) : 0
+        limit: plasmoid ? (Math.ceil(globals.screenRect.height / (theme.mSize(theme.defaultFont).height * 4))) : 0
         showExpired: false
         showDismissed: false
         blacklistedDesktopEntries: notificationSettings.popupBlacklistedApplications
@@ -552,16 +596,28 @@ QtObject {
         source: "PulseAudio.qml"
     }
 
-    property Connections screenWatcher: Connections {
-        target: plasmoid
-        onAvailableScreenRectChanged: repositionTimer.start()
-        onScreenGeometryChanged: repositionTimer.start()
-    }
-
     // Normally popups are repositioned through Qt.callLater but in case of e.g. screen geometry changes we want to compress that
     property Timer repositionTimer: Timer {
         interval: 250
         onTriggered: positionPopups()
+    }
+
+    // Tracks the visual parent's window since mapToItem cannot signal
+    // so that when user resizes panel we reposition the popups live
+    property Connections visualParentWindowConnections: Connections {
+        target: visualParent ? visualParent.Window.window : null
+        function onXChanged() {
+            repositionTimer.start();
+        }
+        function onYChanged() {
+            repositionTimer.start();
+        }
+        function onWidthChanged() {
+            repositionTimer.start();
+        }
+        function onHeightChanged() {
+            repositionTimer.start();
+        }
     }
 
     // Keeps the Inhibited property on DBus in sync with our inhibition handling
